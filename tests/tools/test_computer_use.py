@@ -1079,6 +1079,128 @@ class TestCuaDriverSessionReconnect:
         assert session._reconnect_log == ["stop", "start"]
         assert len(bridge.calls) == 1
 
+    def test_call_tool_reconnects_once_after_mcp_connection_closed(self):
+        """A server-side connection-closed MCP error is treated like a closed transport: reconnect once and replay a read-only call."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import CONNECTION_CLOSED
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [MCPError(CONNECTION_CLOSED, "Connection closed"), {"ok": True}]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                effect = self.effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        assert session.call_tool("list_apps", {}) == {"ok": True}
+        assert session._reconnect_log == ["stop", "start"]
+        assert len(bridge.calls) == 2
+        assert bridge.calls[1][0] == ("call", "list_apps", {})
+
+    def test_mutation_not_replayed_after_mcp_connection_closed(self):
+        """A connection-closed MCP error during a mutating call fails closed instead of silently replaying it."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import CONNECTION_CLOSED
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                raise MCPError(CONNECTION_CLOSED, "Connection closed")
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        result = session.call_tool("click", {"x": 20, "y": 30})
+
+        assert result["isError"] is True
+        assert result["structuredContent"]["code"] == "transport_outcome_unknown"
+        assert result["structuredContent"]["next_step"] == "fresh_state"
+        assert session._reconnect_log == ["stop", "start"]
+        assert len(bridge.calls) == 1
+
+    def test_server_error_code_with_other_message_is_not_treated_as_closed(self):
+        """Code -32000 alone isn't enough: an unrelated message must not trigger reconnect and must propagate untouched."""
+        from mcp.shared.exceptions import MCPError
+
+        error = MCPError(-32000, "some tool failure")
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                raise error
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        with pytest.raises(MCPError) as excinfo:
+            session.call_tool("list_apps", {})
+
+        assert excinfo.value is error
+        assert session._reconnect_log == []
+        assert len(bridge.calls) == 1
+
+    def test_connection_closed_message_with_wrong_code_does_not_reconnect(self):
+        """A 'Connection closed' message with a non-matching code must not trigger reconnect and must propagate untouched."""
+        from mcp.shared.exceptions import MCPError
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                raise MCPError(-32601, "Connection closed")
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        with pytest.raises(MCPError) as excinfo:
+            session.call_tool("list_apps", {})
+
+        assert excinfo.value.code == -32601
+        assert session._reconnect_log == []
+        assert len(bridge.calls) == 1
+
+    def test_group_wrapped_mcp_connection_closed_reconnects(self):
+        """A connection-closed MCPError wrapped in an ExceptionGroup is unwrapped and still triggers a single reconnect."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import CONNECTION_CLOSED
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [
+                    ExceptionGroup("meh", [MCPError(CONNECTION_CLOSED, "Connection closed")]),
+                    {"ok": True},
+                ]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                effect = self.effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        assert session.call_tool("list_apps", {}) == {"ok": True}
+        assert session._reconnect_log == ["stop", "start"]
+        assert len(bridge.calls) == 2
+
     def test_timeout_marks_session_suspect_without_replaying(self):
         """An MCP timeout fails closed: outcome unknown, no silent replay (#74799)."""
         import concurrent.futures

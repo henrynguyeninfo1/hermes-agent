@@ -17,8 +17,14 @@ from typing import Any, Dict, List, Optional
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use import cua_backend_driver as _driver
 from tools.computer_use.cua_backend_parse import _extract_tool_result, _mcp_field, _tool_envelope
+from tools.mcp_tool_errors import _unwrap_exception_group
 
 logger = logging.getLogger("tools.computer_use.cua_backend")
+
+# ``mcp.types.CONNECTION_CLOSED``: the SDK raises MCPError(-32000, "Connection closed") when the stdio
+# channel dies. -32000 is also the generic JSON-RPC server-error code, so classification must pair the code
+# with the message instead of trusting the code alone.
+_MCP_CONNECTION_CLOSED_CODE = -32000
 
 
 class _AsyncBridge:
@@ -387,10 +393,18 @@ class _CuaDriverSession:
     @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
         """True for MCP/stdio failures that are recoverable by reconnecting."""
+        exc = _unwrap_exception_group(exc)
         name, module = exc.__class__.__name__, getattr(exc.__class__, "__module__", "")
-        return (name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
+        if (name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
                 or (module.startswith("anyio") and "Resource" in name)
-                or isinstance(exc, (BrokenPipeError, EOFError)))
+                or isinstance(exc, (BrokenPipeError, EOFError))):
+            return True
+        # A dead stdio channel also surfaces as the SDK's MCPError(CONNECTION_CLOSED, "Connection closed") —
+        # possibly anyio-group-wrapped. Structural code lookup (never isinstance: SDK types drift across
+        # generations), and the message must agree because -32000 is the generic server-error code cua-driver
+        # uses for ordinary tool failures.
+        code = getattr(getattr(exc, "error", None), "code", None) or getattr(exc, "code", None)
+        return code == _MCP_CONNECTION_CLOSED_CODE and "connection closed" in str(exc).lower()
 
     @staticmethod
     def _is_transient_daemon_error(exc: Exception) -> bool:
